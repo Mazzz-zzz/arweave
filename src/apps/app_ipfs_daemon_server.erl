@@ -1,9 +1,9 @@
 -module(app_ipfs_daemon_server).
--export([start/0, stop/0, handle/3]).
+-export([start/0, stop/0, handle/4]).
 -export([put_key_wallet_address/2, put_key_wallet/2, get_key_q_wallet/1, get_keys/0, del_key/1]).
 -export([already_reported/2]).
 -export([cleaner_upper/0, ipfs_getter/4, sufficient_funds/2]).
--include("ar.hrl").
+-include("../ar.hrl").
 
 -ifdef(DEBUG).
 -define(WAIT_CLEANER, 3 * 60 * 1000).
@@ -96,9 +96,9 @@ del_key(APIKey) ->
 	mnesia:activity(transaction, F).
 
 %% @doc Handle /api/ipfs/... calls.
--spec handle(atom(), path(), cowboy_http_request()) -> cowboy_http_response().
-handle(Method, Path, Req) ->
-	case validate_request(Method, Path, Req) of
+-spec handle(atom(), path(), cowboy_http_request(), pid()) -> cowboy_http_response().
+handle(Method, Path, Req, Pid) ->
+	case validate_request(Method, Path, Req, Pid) of
 		{error, Response} ->
 			handle208(Response);
 		{ok, Args} ->
@@ -118,8 +118,8 @@ handle208(Response) -> Response.
 %%% Validators
 
 %% @doc validate a request and return required info
-validate_request(<<"POST">>, [<<"getsend">>], Req) ->
-	case validate_req_fields_auth(Req, [<<"api_key">>, <<"ipfs_hash">>]) of
+validate_request(<<"POST">>, [<<"getsend">>], Req, Pid) ->
+	case validate_req_fields_auth(Req, [<<"api_key">>, <<"ipfs_hash">>], Pid) of
 		{ok, [APIKey, IPFSHash], Queue, Wallet} ->
 			case already_reported(APIKey, IPFSHash) of
 				{ok, _} ->
@@ -140,7 +140,7 @@ validate_request(<<"POST">>, [<<"getsend">>], Req) ->
 		{error, Response} ->
 			{error, Response}
 	end;
-validate_request(<<"GET">>, [APIKey, <<"status">>|Options], Req) ->
+validate_request(<<"GET">>, [APIKey, <<"status">>|Options], Req, _Pid) ->
 	case is_authorized(APIKey, Req) of
 		{ok, _Queue, _Wallet} ->
 			ar:d({get_status, options, Options}),
@@ -148,30 +148,30 @@ validate_request(<<"GET">>, [APIKey, <<"status">>|Options], Req) ->
 		{error, Response} ->
 			{error, Response}
 	end;
-validate_request(<<"GET">>, [APIKey, <<"balance">>], Req) ->
+validate_request(<<"GET">>, [APIKey, <<"balance">>], Req, _Pid) ->
 	case is_authorized(APIKey, Req) of
 		{ok, _Queue, Wallet} ->
 			{ok, [Wallet]};
 		{error, _} ->
 			{error, {401, #{}, <<"Invalid API Key">>, Req}}
 	end;
-validate_request(<<"DEL">>, [APIKey, _IPFSHash], Req) ->
+validate_request(<<"DEL">>, [APIKey, _IPFSHash], Req, _Pid) ->
 	case is_authorized(APIKey, Req) of
 		{ok, _Queue, _Wallet} ->
 			{ok, []};
 		{error, _} ->
 			{error, {401, #{}, <<"Invalid API Key">>, Req}}
 	end;
-validate_request(<<"GET">>, [APIKey, _IPFSHash, <<"tx">>], Req) ->
+validate_request(<<"GET">>, [APIKey, _IPFSHash, <<"tx">>], Req, _Pid) ->
 	case is_authorized(APIKey, Req) of
 		{ok, _Queue, _Wallet} ->
 			{ok, []};
 		{error, _} ->
 			{error, {401, #{}, <<"Invalid API Key">>, Req}}
 	end;
-validate_request(<<"GET">>, [_IPFSHash], _Req) ->
+validate_request(<<"GET">>, [_IPFSHash], _Req, _Pid) ->
 	{ok, []};
-validate_request(_, _, Req) ->
+validate_request(_, _, Req, _Pid) ->
 	{error, {400, #{}, <<"Unrecognised request">>, Req}}.
 
 %%% Processors
@@ -435,13 +435,17 @@ queued_status_hash(APIKey, IPFSHash) ->
 			}]).
 
 %% @doc Given a request, returns the json body as a struct (or error).
-request_to_struct(Req) ->
-	JSON = ar_http_req:body(Req),
-	case ar_serialize:json_decode(JSON) of
-		{ok, {Struct}} ->
-			{ok, Struct, Req};
-		{error, _} ->
-			{error, {400, #{}, <<"Invalid json">>, Req}}
+request_to_struct(Req, Pid) ->
+	case read_complete_body(Req, Pid) of
+		{ok, JSON, Req2} ->
+			case ar_serialize:json_decode(JSON) of
+				{ok, {Struct}} ->
+					{ok, Struct, Req2};
+				{error, _} ->
+					{error, {400, #{}, <<"Invalid json">>, Req2}}
+			end;
+		{error, body_size_too_large} ->
+			{error, {413, #{}, <<"Payload too large">>, Req}}
 	end.
 
 requeue_hashes(APIKey, Queue, Wallet) ->
@@ -507,8 +511,8 @@ sufficient_funds(Wallet, DataSize) ->
 timestamp() ->
 	{utc, calendar:universal_time()}.
 
-validate_req_fields_auth(Req, FieldsRequired) ->
-	case request_to_struct(Req) of
+validate_req_fields_auth(Req, FieldsRequired, Pid) ->
+	case request_to_struct(Req, Pid) of
 		{ok, Struct, NewReq} ->
 			case all_fields(Struct, FieldsRequired) of
 				{ok, APIKey, ReqFields} ->
@@ -545,3 +549,9 @@ mnesia_get_keys() ->
 mnesia_write(Record) ->
 	F = fun() -> mnesia:write(Record) end,
 	mnesia:activity(transaction, F).
+
+read_complete_body(Req, Pid) ->
+	Pid ! {read_complete_body, self(), Req},
+	receive
+		{read_complete_body, Term} -> Term
+	end.
