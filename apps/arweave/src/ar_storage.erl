@@ -10,9 +10,10 @@
 -export([write_block_hash_list/2, read_block_hash_list/1]).
 -export([enough_space/1, select_drive/2]).
 -export([calculate_disk_space/0, calculate_used_space/0, start_update_used_space/0]).
--export([lookup_block_filename/1,lookup_tx_filename/1]).
--export([read_block_file/2, read_tx_file/1]).
+-export([lookup_block_filename/1, lookup_tx_filename/1]).
+-export([read_tx_file/1]).
 -export([ensure_directories/0]).
+-export([rename_block_files/1]).
 
 -include("ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -28,7 +29,7 @@
 start() ->
 	ar_firewall:start(),
 	ensure_directories(),
-	ar_block_index:start(),
+	count_blocks_on_disk(),
 	case ar_meta_db:get(disk_space) of
 		undefined ->
 			%% Add some margin for filesystem overhead.
@@ -49,6 +50,55 @@ ensure_directories() ->
 	filelib:ensure_dir(filename:join(DataDir, ?WALLET_LIST_DIR) ++ "/"),
 	filelib:ensure_dir(filename:join(DataDir, ?HASH_LIST_DIR) ++ "/").
 
+count_blocks_on_disk() ->
+	spawn(
+		fun() ->
+			DataDir = ar_meta_db:get(data_dir),
+			case file:list_dir(filename:join(DataDir, ?BLOCK_DIR)) of
+				{ok, List} ->
+					ar_meta_db:increase(blocks_on_disk, length(List));
+				{error, Reason} ->
+					ar:warn([
+						{event, failed_to_count_blocks_on_disk},
+						{reason, Reason}
+					])
+			end
+		end
+	).
+
+rename_block_files(HL) ->
+	BlocksDir = filename:join(ar_meta_db:get(data_dir), ?BLOCK_DIR),
+	case filelib:is_file(filename:join(BlocksDir, "blocks_renamed")) of
+		true ->
+			ok;
+		false ->
+			spawn(
+				fun() ->
+					ar:info([{event, start_rename_block_files}]),
+					lists:foldl(
+						fun(H, Height) ->
+							EncodedH = binary_to_list(ar_util:encode(H)),
+							LegacyName = filename:join(
+								BlocksDir,
+								integer_to_list(Height) ++ "_" ++ EncodedH ++ ".json"
+							),
+							NewName = filename:join(
+								BlocksDir,
+								EncodedH ++ ".json"
+							),
+							file:rename(LegacyName, NewName),
+							Height - 1
+						end,
+						length(HL) - 1,
+						HL
+					),
+					write_file_atomic(filename:join(BlocksDir, "blocks_renamed"), <<>>),
+					ar:info([{event, rename_block_files_complete}])
+				end
+			),
+			ok
+	end.
+
 write_file_atomic(Filename, Data) ->
 	SwapFilename = Filename ++ ".swp",
 	case file:write_file(SwapFilename, Data) of
@@ -58,18 +108,32 @@ write_file_atomic(Filename, Data) ->
 			Error
 	end.
 
-%% @doc Clear the cache of saved blocks.
+lookup_block_filename(Hash) ->
+	Filepath = block_filepath(Hash),
+	case filelib:is_file(Filepath) of
+		true ->
+			Filepath;
+		false ->
+			unavailable
+	end.
+
+%% @doc Remove blocks from disk. Used in tests.
 clear() ->
-	lists:map(fun file:delete/1, filelib:wildcard(filename:join([ar_meta_db:get(data_dir), ?BLOCK_DIR, "*.json"]))),
-	ar_block_index:clear().
+	lists:map(
+		fun file:delete/1,
+		filelib:wildcard(
+			filename:join([ar_meta_db:get(data_dir), ?BLOCK_DIR, "*.json"])
+		)
+	),
+	ar_meta_db:put(blocks_on_disk, 0).
 
 %% @doc Returns the number of blocks stored on disk.
 blocks_on_disk() ->
-	ar_block_index:count().
+	ar_meta_db:get(blocks_on_disk).
 
 %% @doc Move a block into the 'invalid' block directory.
 invalidate_block(B) ->
-	ar_block_index:remove(B#block.indep_hash),
+	ar_meta_db:increase(blocks_on_disk, -1),
 	TargetFile = invalid_block_filepath(B),
 	filelib:ensure_dir(TargetFile),
 	file:rename(block_filepath(B), TargetFile).
@@ -88,7 +152,7 @@ write_block(RawB) ->
 	case enough_space(byte_size(BlockToWrite)) of
 		true ->
 			write_file_atomic(Name = block_filepath(B), BlockToWrite),
-			ar_block_index:add(B, Name),
+			ar_meta_db:increase(blocks_on_disk, 1),
 			ar_meta_db:increase(used_space, byte_size(BlockToWrite)),
 			Name;
 		false ->
@@ -140,23 +204,38 @@ write_encrypted_block(Hash, B) ->
 			{error, enospc}
 	end.
 
-%% @doc Read a block from disk, given a hash.
-read_block(unavailable, _BHL) -> unavailable;
-read_block(B, _BHL) when is_record(B, block) -> B;
-read_block(Bs, BHL) when is_list(Bs) ->
-	lists:map(fun(B) -> read_block(B, BHL) end, Bs);
-read_block(ID, BHL) ->
-	case ar_block_index:get_block_filename(ID) of
-		unavailable -> unavailable;
-		Filename -> read_block_file(Filename, BHL)
+%% @doc Read the block from disk, given a hash or a height.
+read_block(unavailable, _HL) ->
+	unavailable;
+read_block(B, _HL) when is_record(B, block) ->
+	B;
+read_block(Blocks, HL) when is_list(Blocks) ->
+	lists:map(fun(B) -> read_block(B, HL) end, Blocks);
+read_block(Height, HL) when is_integer(Height) ->
+	case Height of
+		_ when Height < 0 ->
+			unavailable;
+		_ when Height > length(HL) - 1 ->
+			unavailable;
+		_ ->
+			BH = lists:nth(length(HL) - Height, HL),
+			read_block(BH, HL)
+	end;
+read_block(Hash, HL) when is_binary(Hash) ->
+	case lookup_block_filename(Hash) of
+		unavailable ->
+			unavailable;
+		Filename ->
+			read_block_file(Filename, HL)
 	end.
-read_block_file(Filename, BHL) ->
+
+read_block_file(Filename, HL) ->
 	{ok, Binary} = file:read_file(Filename),
 	B = ar_serialize:json_struct_to_block(Binary),
 	WL = B#block.wallet_list,
 	FinalB =
 		B#block {
-			hash_list = ar_block:generate_hash_list_for_block(B, BHL),
+			hash_list = ar_block:generate_hash_list_for_block(B, HL),
 			wallet_list =
 				case WL of
 					WL when is_list(WL) ->
@@ -210,9 +289,6 @@ start_update_used_space() ->
 			)
 		end
 	).
-
-lookup_block_filename(ID) ->
-	ar_block_index:get_block_filename(ID).
 
 write_tx(TXs) when is_list(TXs) -> lists:foreach(fun write_tx/1, TXs);
 write_tx(TX) ->
@@ -364,13 +440,9 @@ to_string(String) ->
 	String.
 
 block_filename(B) when is_record(B, block) ->
-	iolist_to_binary([
-		integer_to_list(B#block.height), "_", ar_util:encode(B#block.indep_hash), ".json"
-	]);
+	block_filename(B#block.indep_hash);
 block_filename(Hash) when is_binary(Hash) ->
-	iolist_to_binary(["*_", ar_util:encode(Hash), ".json"]);
-block_filename(Height) when is_integer(Height) ->
-	iolist_to_binary([integer_to_list(Height), "_*.json"]).
+	binary_to_list(ar_util:encode(Hash)) ++ ".json".
 
 block_filepath(B) ->
 	filepath([?BLOCK_DIR, block_filename(B)]).
@@ -430,13 +502,12 @@ invalidate_block_test() ->
 	invalidate_block(B),
 	timer:sleep(500),
 	unavailable = read_block(B#block.indep_hash, B#block.hash_list),
-	TargetFile =
-		lists:flatten(
-			io_lib:format(
-				"~s/invalid/~w_~s.json",
-				[ar_meta_db:get(data_dir) ++ "/" ++ ?BLOCK_DIR, B#block.height, ar_util:encode(B#block.indep_hash)]
-			)
-		),
+	TargetFile = filename:join([
+		ar_meta_db:get(data_dir),
+		?BLOCK_DIR,
+		"invalid",
+		binary_to_list(ar_util:encode(B#block.indep_hash)) ++ ".json"
+	]),
 	?assertEqual(B, read_block_file(TargetFile, B#block.hash_list)).
 
 store_and_retrieve_block_hash_list_test() ->

@@ -110,11 +110,11 @@ get_block(BH, BHL, Peers) ->
 
 %% Read block from storage without hash_list and wallet_list.
 block_from_storage(BH) ->
-	case ar_block_index:get_block_filename(BH) of
+	case ar_storage:lookup_block_filename(BH) of
 		unavailable ->
 			not_found;
-		Filename ->
-			{ok, Binary} = file:read_file(Filename),
+		Filepath ->
+			{ok, Binary} = file:read_file(Filepath),
 			{ok, ar_serialize:json_struct_to_block(Binary)}
 	end.
 
