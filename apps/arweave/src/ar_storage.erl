@@ -1,6 +1,7 @@
 -module(ar_storage).
 
 -export([start/0]).
+-export([write_file_atomic/2]).
 -export([write_block/1, write_full_block/1, write_full_block/2, read_block/2, clear/0]).
 -export([write_encrypted_block/2, read_encrypted_block/1, invalidate_block/1]).
 -export([delete_block/1, blocks_on_disk/0, block_exists/1]).
@@ -49,6 +50,15 @@ ensure_directories() ->
 	filelib:ensure_dir(filename:join(DataDir, ?WALLET_LIST_DIR) ++ "/"),
 	filelib:ensure_dir(filename:join(DataDir, ?HASH_LIST_DIR) ++ "/").
 
+write_file_atomic(Filename, Data) ->
+	SwapFilename = Filename ++ ".swp",
+	case file:write_file(SwapFilename, Data) of
+		ok ->
+			file:rename(SwapFilename, Filename);
+		Error ->
+			Error
+	end.
+
 %% @doc Clear the cache of saved blocks.
 clear() ->
 	lists:map(fun file:delete/1, filelib:wildcard(filename:join([ar_meta_db:get(data_dir), ?BLOCK_DIR, "*.json"]))),
@@ -91,7 +101,7 @@ write_block(RawB) ->
 	WalletID = write_wallet_list(RawB#block.wallet_list),
 	B = RawB#block { wallet_list = WalletID },
 	BlockToWrite = ar_serialize:jsonify(ar_serialize:block_to_json_struct(B)),
-	file:write_file(Name = block_filepath(B), BlockToWrite),
+	write_file_atomic(Name = block_filepath(B), BlockToWrite),
 	ar_block_index:add(B, Name),
 	Name.
 -else.
@@ -108,7 +118,7 @@ write_block(RawB) ->
 	BlockToWrite = ar_serialize:jsonify(ar_serialize:block_to_json_struct(B)),
 	case enough_space(byte_size(BlockToWrite)) of
 		true ->
-			file:write_file(Name = block_filepath(B), BlockToWrite),
+			write_file_atomic(Name = block_filepath(B), BlockToWrite),
 			ar_block_index:add(B, Name),
 			spawn(
 				ar_meta_db,
@@ -155,14 +165,14 @@ write_full_block(BShadow, TXs) ->
 -ifdef(DEBUG).
 write_encrypted_block(Hash, B) ->
 	BlockToWrite = B,
-	file:write_file(Name = encrypted_block_filepath(Hash), BlockToWrite),
+	write_file_atomic(Name = encrypted_block_filepath(Hash), BlockToWrite),
 	Name.
 -else.
 write_encrypted_block(Hash, B) ->
 	BlockToWrite = B,
 	case enough_space(byte_size(BlockToWrite)) of
 		true ->
-			file:write_file(Name = encrypted_block_filepath(Hash), BlockToWrite),
+			write_file_atomic(Name = encrypted_block_filepath(Hash), BlockToWrite),
 			spawn(
 				ar_meta_db,
 				increase,
@@ -276,7 +286,7 @@ tx_exists(Hash) ->
 -ifdef(DEBUG).
 write_tx(TXs) when is_list(TXs) -> lists:foreach(fun write_tx/1, TXs);
 write_tx(TX) ->
-	file:write_file(
+	write_file_atomic(
 		Name = tx_filepath(TX),
 		ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX))
 	),
@@ -287,7 +297,7 @@ write_tx(TX) ->
 	TXToWrite = ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX)),
 	case enough_space(byte_size(TXToWrite)) of
 		true ->
-			file:write_file(
+			write_file_atomic(
 				Name = tx_filepath(TX),
 				ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX))
 			),
@@ -338,14 +348,14 @@ read_tx_file(Filename) ->
 write_block_hash_list(Hash, BHL) ->
 	ar:report([{writing_block_hash_list_to_disk, ID = ar_util:encode(Hash)}]),
 	JSON = ar_serialize:jsonify(ar_serialize:hash_list_to_json_struct(BHL)),
-	file:write_file(hash_list_filepath(Hash), JSON),
+	write_file_atomic(hash_list_filepath(Hash), JSON),
 	ID.
 
 %% Write a block hash list to disk for retreival later (in emergencies).
 write_wallet_list(WalletList) ->
 	ID = ar_block:hash_wallet_list(WalletList),
 	JSON = ar_serialize:jsonify(ar_serialize:wallet_list_to_json_struct(WalletList)),
-	file:write_file(wallet_list_filepath(ID), JSON),
+	write_file_atomic(wallet_list_filepath(ID), JSON),
 	ID.
 
 %% @doc Read a list of block hashes from the disk.
@@ -556,5 +566,5 @@ handle_corrupted_wallet_list_test() ->
 	ar_storage:write_block(B0),
 	?assertEqual(B0, read_block(B0#block.indep_hash, B0#block.hash_list)),
 	WalletListHash = ar_block:hash_wallet_list(B0#block.wallet_list),
-	ok = file:write_file(wallet_list_filepath(WalletListHash), <<>>),
+	ok = write_file_atomic(wallet_list_filepath(WalletListHash), <<>>),
 	?assertEqual(unavailable, read_block(B0#block.indep_hash, B0#block.hash_list)).
