@@ -1115,7 +1115,7 @@ process_request(get_block, [Type, ID, <<"hash_list">>], Req) ->
 			BlockBHL = case Type of
 				<<"height">> ->
 					{_, BHL} = lists:split(
-						length(CurrentBHL) - binary_to_integer(ID),
+						length(CurrentBHL) - ID,
 						CurrentBHL
 					),
 					BHL;
