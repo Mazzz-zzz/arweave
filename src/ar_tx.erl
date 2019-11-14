@@ -110,7 +110,7 @@ do_verify(TX, Diff, Height, Wallets, Timestamp) ->
 		 validate_overspend(TX, ar_node_utils:apply_tx(Wallets, TX, Height))},
 		{tx_signature_not_valid,
 		 ar_wallet:verify(TX#tx.owner, signature_data_segment(TX), TX#tx.signature)}
-	] ++ tx_field_size_limit(TX, Height),
+	] ++ tx_field_size_limits(TX, Height),
 	KeepFailed = fun
 		({_, true}) ->
 			false;
@@ -234,7 +234,7 @@ min_tx_cost(DataSize, _Diff, DiffCenter) ->
 	min_tx_cost(DataSize, DiffCenter, DiffCenter).
 
 %% @doc Check whether each field in a transaction is within the given byte size limits.
-tx_field_size_limit(TX, Height) ->
+tx_field_size_limits(TX, Height) ->
 	Fork_1_8 = ar_fork:height_1_8(),
 	LastTXLimit = case Height of
 		H when H >= Fork_1_8 ->
