@@ -119,6 +119,10 @@ lookup_block_filename(Hash) ->
 
 %% @doc Remove blocks from disk. Used in tests.
 clear() ->
+	clear_internal().
+
+-ifdef(DEBUG).
+clear_internal() ->
 	lists:map(
 		fun file:delete/1,
 		filelib:wildcard(
@@ -126,6 +130,10 @@ clear() ->
 		)
 	),
 	ar_meta_db:put(blocks_on_disk, 0).
+-else.
+clear_internal() ->
+	noop.
+-endif.
 
 %% @doc Returns the number of blocks stored on disk.
 blocks_on_disk() ->
