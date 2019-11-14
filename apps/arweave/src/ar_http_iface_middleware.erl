@@ -509,11 +509,15 @@ handle(<<"GET">>, [<<"block">>, Type, ID], Req) ->
 					{ok, Hash}              -> ar_storage:lookup_block_filename(Hash)
 				end;
 			<<"height">> ->
+				Node = whereis(http_entrypoint_node),
+				CurrentHeight = ar_node:get_height(Node),
 				try binary_to_integer(ID) of
 					Height when Height < 0 ->
 						invalid_height;
+					Height when Height > CurrentHeight ->
+						unavailable;
 					Height ->
-						HL = ar_node:get_hash_list(whereis(http_entrypoint_node)),
+						HL = ar_node:get_hash_list(Node),
 						case Height > length(HL) - 1 of
 							true ->
 								unavailable;
