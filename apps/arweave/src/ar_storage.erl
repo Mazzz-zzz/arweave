@@ -13,7 +13,6 @@
 -export([lookup_block_filename/1, lookup_tx_filename/1]).
 -export([read_tx_file/1]).
 -export([ensure_directories/0]).
--export([rename_block_files/1]).
 
 -include("ar.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -65,39 +64,6 @@ count_blocks_on_disk() ->
 			end
 		end
 	).
-
-rename_block_files(HL) ->
-	BlocksDir = filename:join(ar_meta_db:get(data_dir), ?BLOCK_DIR),
-	case filelib:is_file(filename:join(BlocksDir, "blocks_renamed")) of
-		true ->
-			ok;
-		false ->
-			spawn(
-				fun() ->
-					ar:info([{event, start_rename_block_files}]),
-					lists:foldl(
-						fun(H, Height) ->
-							EncodedH = binary_to_list(ar_util:encode(H)),
-							LegacyName = filename:join(
-								BlocksDir,
-								integer_to_list(Height) ++ "_" ++ EncodedH ++ ".json"
-							),
-							NewName = filename:join(
-								BlocksDir,
-								EncodedH ++ ".json"
-							),
-							file:rename(LegacyName, NewName),
-							Height - 1
-						end,
-						length(HL) - 1,
-						HL
-					),
-					write_file_atomic(filename:join(BlocksDir, "blocks_renamed"), <<>>),
-					ar:info([{event, rename_block_files_complete}])
-				end
-			),
-			ok
-	end.
 
 write_file_atomic(Filename, Data) ->
 	SwapFilename = Filename ++ ".swp",
